@@ -10,6 +10,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
+from llama_index.vector_stores.types import VectorStoreInfo, MetadataInfo
 
 
 from llama_index import download_loader
@@ -28,8 +29,7 @@ from langchain.chat_models import ChatOpenAI
 import chromadb
 from chromadb.config import Settings
 
-import openai # 
-
+import openai
 import redis
 
 load_dotenv()
@@ -62,17 +62,33 @@ chroma_client = chromadb.Client(Settings(
     persist_directory=persist_directory
 ))
 
-embed_model = OpenAIEmbedding(model="text-embedding-ada-002", openai_api_key=os.environ["OPENAI_API_KEY"],)
+embed_model = OpenAIEmbedding(model="text-embedding-ada-002", openai_api_key=os.environ["OPENAI_API_KEY"])
 llm = ChatOpenAI(temperature=0, model_name="gpt-4", openai_api_key=os.environ["OPENAI_API_KEY"], streaming=True)
 service_context = ServiceContext.from_defaults(llm=llm, embed_model=embed_model)
 hyde = HyDEQueryTransform(include_original=True)
 
 UnstructuredURLLoader = download_loader("UnstructuredURLLoader")
 
+vector_store_info = VectorStoreInfo(
+    content_info="Content of a URL",
+    metadata_info=[
+        MetadataInfo(
+            name="source",
+            type="str",
+            description="a web URL",
+        ),
+        MetadataInfo(
+            name="index_id",
+            type="str",
+            description="Unique group of urls",
+        ),
+    ],
+)
+
 def get_collection():
     collection = chroma_client.get_or_create_collection(name="indexes")
     vector_store = ChromaVectorStore(chroma_collection=collection)
-    index = VectorStoreIndex.from_vector_store(vector_store=vector_store, service_context=service_context)
+    index = VectorStoreIndex.from_vector_store(vector_store=vector_store, service_context=service_context, vector_store_info=vector_store_info)
     
     return index
 
@@ -94,7 +110,8 @@ def get_index_chat_engine(indexes):
     else:
         index_filters =  {"index_id": {"$eq": indexes[0]}}
 
-    return collection.as_chat_engine(chat_mode="context", streaming=True, verbose=True, vector_store_kwargs={"where": index_filters})
+    return collection.as_chat_engine(chat_mode="react", similarity_top_k=21, response_mode="tree_summarize", vector_store_query_mode="default",  streaming=True, verbose=True, vector_store_kwargs={"where": index_filters})
+
 
 class ChatStream(BaseModel):
     id: str
@@ -102,15 +119,9 @@ class ChatStream(BaseModel):
     indexes: Optional[List[str]]
     messages: List[ChatMessage]
 
-class Prompt(BaseModel):
-    prompt: str
-
 class Link(BaseModel):
     url: str
 
-class Composition(BaseModel):
-    did: str
-    prompt: str
 
 def response_generator(response):
     yield json.dumps({
@@ -120,9 +131,6 @@ def response_generator(response):
     for text in response.response_gen:
         yield text
 
-@app.get("/")
-def home():
-    return JSONResponse(content="ia")
 
 @app.post("/index/{index_id}/links")
 def add(index_id, link: Link):
@@ -138,13 +146,14 @@ def add(index_id, link: Link):
     except Exception as e:
         return JSONResponse(content={'message': 'Url load error'}, status_code=400)
     
-    kb_data = loader.load()
-
     if not kb_data:
         return JSONResponse(content={'message': 'No data loaded from the provided link'}, status_code=400)
+    
+    doc = kb_data[0]
+    # doc.embedding = embed_model.get_text_embedding(doc.text)
+    doc.metadata["index_id"] = index_id
 
-    kb_data[0].metadata["index_id"] = index_id
-    collection.insert(kb_data[0])
+    collection.insert(doc)
     chroma_client.persist()
 
     return JSONResponse(content={'message': 'Document added successfully'})
@@ -152,30 +161,6 @@ def add(index_id, link: Link):
 @app.delete("/index/{index_id}/links")
 def remove(index_id: str, link: Link):
     return JSONResponse(content={"message": "Documents deleted successfully"})
-
-
-@app.post("/compose_new")
-def query(prompt: Prompt):
-
-    collection = get_collection()
-
-    
-    hyde_query_engine = TransformQueryEngine( collection.as_query_engine(), hyde)
-
-    response = hyde_query_engine.query(prompt.prompt)
-
-    print(response.get_formatted_sources())
-
-    return JSONResponse(content={
-        "sources": [{"id": s.node.id_, "url": s.node.metadata.get("source"), "index_id": s.node.metadata.get("index_id")} for s in response.source_nodes],
-        "response": response.response
-    })
-
-@app.post("/index/{index_id}/prompt")
-async def query(index_id, prompt: Prompt):
-    response = get_query_engine([index_id]).query(prompt.prompt)    
-    return StreamingResponse(response_generator(response), media_type='text/event-stream')
-
 
 @app.post("/chat_stream")
 def chat_stream(params: ChatStream):
@@ -188,13 +173,14 @@ def chat_stream(params: ChatStream):
     elif params.indexes:
         indexes = params.indexes
 
-    print(indexes)
     index = get_index_chat_engine(indexes)
 
     messages = params.messages
     last_message = messages[-1]
 
-    streaming_response = index.stream_chat(message=last_message.content, chat_history=messages)
+    streaming_response = index.chat(message=last_message.content, chat_history=messages)
+    print(streaming_response.response)
+    return JSONResponse(content=streaming_response.response)
 
     def response_generator():
         for text in streaming_response.response_gen:
@@ -208,35 +194,12 @@ def chat_stream(params: ChatStream):
         
     return StreamingResponse(response_generator(), media_type='text/event-stream')
 
+@app.get("/debug")
+def debug():
+    collection = chroma_client.get_or_create_collection(name="indexes")
+    x = collection.get(include=["metadatas", "documents", "embeddings"])
+    return JSONResponse(x)
 
-
-@app.post("/compose")
-def compose(c: Composition):
-
-
-    id_resp = redisClient.hkeys("user_indexes:by_did:" + c.did.lower())
-    
-    index_ids = [item.decode('utf-8').split(':')[0] for item in id_resp]
-    
-    indexes = list(map(lambda index_id: get_index(index_id=index_id), index_ids))
-    indexes = [get_index(index_id=index_id) for index_id in index_ids if get_index(index_id=index_id)]
-    
-    
-    summaries = redisClient.hmget("summaries", index_ids)
-    
-    graph = ComposableGraph.from_indices(
-        ListIndex,
-        indexes,
-        index_summaries=summaries,
-        max_keywords_per_chunk=2000,  
-    )
-    query_engine = graph.as_query_engine()
-    response = query_engine.query(c.prompt)
-    return JSONResponse(content={
-        #"sources": [{"id": s.node.id_, "url": s.node.metadata.get("source"), "index_id": s.node.metadata.get("index_id")} for s in response.source_nodes],                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         
-        "response": response.response
-    })
-      
 
 if __name__ == "__main__":
     import uvicorn
